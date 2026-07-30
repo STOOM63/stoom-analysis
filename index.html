@@ -9,6 +9,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./assets/css/styles.css">
+  <link rel="stylesheet" href="./assets/css/fixes.css">
 </head>
 <body>
   <div id="loader" class="loader show"><div class="loader-core"><span>A</span><i></i><i></i></div><p id="loaderText">Initialisation de ANALYSIS…</p></div>
@@ -26,7 +27,20 @@
     </header>
     <div id="content"></div>
   </main>
+
+  <div id="drawerOverlay" class="drawer-overlay" aria-hidden="true">
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle">
+      <header class="drawer-head">
+        <p id="drawerEyebrow">ANALYSIS DETAIL</p>
+        <h2 id="drawerTitle">Détail</h2>
+        <button type="button" class="drawer-close" id="drawerClose" aria-label="Fermer">×</button>
+      </header>
+      <div id="drawerBody" class="drawer-body"></div>
+    </aside>
+  </div>
+
   <div id="toast" class="toast"></div>
+  <script src="./assets/js/ui-fixes.js"></script>
   <script type="module" src="./assets/js/app.js"></script>
 </body>
 </html>
