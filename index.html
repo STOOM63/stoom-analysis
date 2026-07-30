@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#060b12">
+  <meta name="description" content="ANALYSIS — superintelligence commerciale explicable pour ventes, stock, clients, vendeurs, paniers, fournisseurs et commandes.">
+  <title>ANALYSIS — Commerce Superintelligence Engine</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./assets/css/styles.css">
+</head>
+<body>
+  <div id="loader" class="loader show"><div class="loader-core"><span>A</span><i></i><i></i></div><p id="loaderText">Initialisation de ANALYSIS…</p></div>
+  <aside class="sidebar">
+    <button class="brand" id="brandHome"><span class="brand-mark">A</span><span><strong>ANALYSIS</strong><small>Retail Intelligence</small></span></button>
+    <div class="workspace"><span>ESPACE ACTIF</span><strong id="storeName">Mon magasin</strong><small id="syncStatus">Aucune donnée</small></div>
+    <nav id="nav"></nav>
+    <div class="sidebar-foot"><div class="privacy-chip"><span></span><div><strong>Données locales</strong><small>Aucun envoi externe</small></div></div><button class="nav-item" data-view="imports">↗ <span>Sauvegarde & réglages</span></button></div>
+  </aside>
+  <main class="app-main">
+    <header class="topbar">
+      <button class="menu-toggle" id="menuToggle" aria-label="Menu">☰</button>
+      <div class="period-controls"><label>Du <input type="date" id="periodStart"></label><span>→</span><label>au <input type="date" id="periodEnd"></label><select id="periodPreset"><option value="">Période personnalisée</option><option value="7">7 derniers jours</option><option value="30">30 derniers jours</option><option value="90">90 derniers jours</option><option value="180">180 derniers jours</option><option value="365">12 derniers mois</option></select></div>
+      <div class="top-actions"><button class="command-button" title="Analysis Intelligence" onclick="document.querySelector('[data-view=explorer]')?.click()"><kbd>⌘</kbd><span>Poser une question</span></button><button class="btn primary" id="globalImport">Importer</button><input type="file" id="globalFileInput" multiple accept=".xlsx,.xls,.csv" hidden></div>
+    </header>
+    <div id="content"></div>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script type="module" src="./assets/js/app.js"></script>
+</body>
+</html>

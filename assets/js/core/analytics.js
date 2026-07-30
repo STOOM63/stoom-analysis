@@ -1,0 +1,990 @@
+import {
+  addDays, clamp, daysBetween, groupBy, indexBy, isoDate, mean, median, normalizeText, parseDate, quantile, safeDiv, stddev, sum, toNumber
+} from './utils.js';
+
+const DAY = 86400000;
+
+function inPeriod(date, start, end) {
+  const d = date instanceof Date ? date : parseDate(date);
+  if (!d) return false;
+  return (!start || d >= start) && (!end || d <= end);
+}
+
+function dateExtent(rows, fields = ['date']) {
+  const dates = [];
+  for (const row of rows) for (const field of fields) {
+    const d = parseDate(row[field]);
+    if (d) dates.push(d);
+  }
+  return dates.length ? { min: new Date(Math.min(...dates)), max: new Date(Math.max(...dates)) } : { min: null, max: null };
+}
+
+function buildProductMap(data) {
+  const map = new Map();
+  for (const source of [data.catalogue, data.stock, data.valuation]) {
+    for (const row of source) map.set(row.code, { ...(map.get(row.code) || {}), ...row });
+  }
+  for (const row of data.sales) {
+    if (row.code && !map.has(row.code)) {
+      map.set(row.code, {
+        code: row.code, name: row.name, department: row.department, family: row.family,
+        subfamily: row.subfamily, supplier: '', stock: 0, historicalOnly: true
+      });
+    }
+  }
+  return map;
+}
+
+function lineFinancials(line, productMap) {
+  const product = productMap.get(line.code) || {};
+  const taxRate = Number.isFinite(product.taxRate) ? product.taxRate : 20;
+  const revenueTTC = toNumber(line.saleTTC);
+  const revenueHT = revenueTTC / (1 + taxRate / 100);
+  const costHT = toNumber(line.purchaseHT);
+  const marginHT = revenueHT - costHT;
+  const listPriceTTC = toNumber(product.priceTTC);
+  const theoreticalTTC = line.quantity > 0 && listPriceTTC > 0 ? listPriceTTC * line.quantity : revenueTTC;
+  const discountTTC = line.quantity > 0 ? Math.max(0, theoreticalTTC - revenueTTC) : 0;
+  const discountHT = discountTTC / (1 + taxRate / 100);
+  return { revenueTTC, revenueHT, costHT, marginHT, discountTTC, discountHT, taxRate };
+}
+
+function ticketKey(line) {
+  return line.saleId || line.ticket || line.invoice || `${line.date}|${line.seller}|${line.customerName}`;
+}
+
+function groupTickets(lines, productMap) {
+  const map = new Map();
+  for (const line of lines) {
+    const key = ticketKey(line);
+    if (!map.has(key)) {
+      map.set(key, {
+        key, date: parseDate(line.date), seller: line.seller || 'NON RENSEIGNÉ', customer: line.customerName || '',
+        lines: [], revenueTTC: 0, revenueHT: 0, costHT: 0, marginHT: 0, items: 0,
+        discountTTC: 0, discountHT: 0, families: new Set(), products: new Set(), segments: new Set(), hasReturn: false
+      });
+    }
+    const ticket = map.get(key);
+    const fin = lineFinancials(line, productMap);
+    ticket.lines.push(line);
+    ticket.revenueTTC += fin.revenueTTC;
+    ticket.revenueHT += fin.revenueHT;
+    ticket.costHT += fin.costHT;
+    ticket.marginHT += fin.marginHT;
+    ticket.items += line.quantity;
+    ticket.discountTTC += fin.discountTTC;
+    ticket.discountHT += fin.discountHT;
+    if (line.family) ticket.families.add(line.family);
+    if (line.code) ticket.products.add(line.code);
+    ticket.segments.add(commercialSegment(line));
+    ticket.hasReturn ||= line.isReturn === true || line.quantity < 0;
+  }
+  return [...map.values()].sort((a, b) => a.date - b.date);
+}
+
+function previousPeriod(start, end) {
+  if (!start || !end) return null;
+  const duration = Math.max(1, Math.round((end - start) / DAY) + 1);
+  const prevEnd = new Date(start);
+  prevEnd.setMilliseconds(-1);
+  const prevStart = addDays(new Date(start), -duration);
+  return { start: prevStart, end: prevEnd, days: duration };
+}
+
+function kpisFromLines(lines, productMap) {
+  const tickets = groupTickets(lines, productMap);
+  const financials = lines.map(line => lineFinancials(line, productMap));
+  const revenueTTC = sum(financials.map(x => x.revenueTTC));
+  const revenueHT = sum(financials.map(x => x.revenueHT));
+  const costHT = sum(financials.map(x => x.costHT));
+  const marginHT = revenueHT - costHT;
+  const positiveTickets = tickets.filter(t => t.revenueTTC >= 0);
+  const identified = tickets.filter(t => normalizeText(t.customer));
+  const uniqueCustomers = new Set(identified.map(t => normalizeText(t.customer))).size;
+  return {
+    revenueTTC, revenueHT, costHT, marginHT,
+    markupRate: safeDiv(marginHT, revenueHT), marginRate: safeDiv(marginHT, costHT),
+    tickets: tickets.length, uniqueTickets: new Set(tickets.map(t => t.key)).size,
+    items: sum(lines.map(r => r.quantity)), customers: uniqueCustomers, uniqueIdentifiedCustomers: uniqueCustomers,
+    anonymousTickets: tickets.filter(t => !normalizeText(t.customer)).length,
+    averageBasketTTC: safeDiv(revenueTTC, positiveTickets.length || tickets.length),
+    averageBasketHT: safeDiv(revenueHT, positiveTickets.length || tickets.length),
+    averageBasket: safeDiv(revenueTTC, positiveTickets.length || tickets.length),
+    medianBasketTTC: median(positiveTickets.map(t => t.revenueTTC)),
+    medianBasketHT: median(positiveTickets.map(t => t.revenueHT)),
+    medianBasket: median(positiveTickets.map(t => t.revenueTTC)),
+    itemsPerTicket: safeDiv(sum(lines.filter(r => r.quantity > 0).map(r => r.quantity)), positiveTickets.length || tickets.length),
+    marginPerTicketHT: safeDiv(marginHT, positiveTickets.length || tickets.length),
+    marginPerTicket: safeDiv(marginHT, positiveTickets.length || tickets.length),
+    discountTTC: sum(financials.map(x => x.discountTTC)),
+    discountHT: sum(financials.map(x => x.discountHT)),
+    discountValue: sum(financials.map(x => x.discountTTC)),
+    returnValueTTC: Math.abs(sum(lines.filter(r => r.isReturn || r.quantity < 0).map(r => lineFinancials(r, productMap).revenueTTC))),
+    returnValueHT: Math.abs(sum(lines.filter(r => r.isReturn || r.quantity < 0).map(r => lineFinancials(r, productMap).revenueHT))),
+    returnLines: lines.filter(r => r.isReturn || r.quantity < 0).length,
+    freeUnits: sum(lines.filter(r => r.discountRate >= .999 && r.quantity > 0).map(r => r.quantity)),
+    identifiedRate: safeDiv(identified.length, tickets.length), ticketsList: tickets
+  };
+}
+
+function dailySeries(lines, productMap) {
+  const map = new Map();
+  for (const line of lines) {
+    const key = isoDate(line.date);
+    if (!key) continue;
+    if (!map.has(key)) map.set(key, { date: key, revenueTTC: 0, revenueHT: 0, revenue: 0, marginHT: 0, margin: 0, tickets: new Set(), items: 0 });
+    const item = map.get(key);
+    const fin = lineFinancials(line, productMap);
+    item.revenueTTC += fin.revenueTTC;
+    item.revenueHT += fin.revenueHT;
+    item.revenue += fin.revenueTTC;
+    item.marginHT += fin.marginHT;
+    item.margin += fin.marginHT;
+    item.items += line.quantity;
+    item.tickets.add(ticketKey(line));
+  }
+  return [...map.values()].sort((a, b) => a.date.localeCompare(b.date)).map(r => ({ ...r, tickets: r.tickets.size }));
+}
+
+function categoryStats(lines, productMap, field = 'department') {
+  const map = new Map();
+  for (const line of lines) {
+    const key = line[field] || 'NON CLASSÉ';
+    const fin = lineFinancials(line, productMap);
+    if (!map.has(key)) map.set(key, { name: key, revenueTTC: 0, revenueHT: 0, revenue: 0, marginHT: 0, margin: 0, quantity: 0, tickets: new Set(), customers: new Set() });
+    const x = map.get(key);
+    x.revenueTTC += fin.revenueTTC;
+    x.revenueHT += fin.revenueHT;
+    x.revenue += fin.revenueTTC;
+    x.marginHT += fin.marginHT;
+    x.margin += fin.marginHT;
+    x.quantity += line.quantity;
+    x.tickets.add(ticketKey(line));
+    if (line.customerName) x.customers.add(normalizeText(line.customerName));
+  }
+  return [...map.values()].map(x => ({
+    ...x, tickets: x.tickets.size, customers: x.customers.size, markupRate: safeDiv(x.marginHT, x.revenueHT)
+  })).sort((a, b) => b.revenueTTC - a.revenueTTC);
+}
+
+function commercialSegment(item) {
+  const text = normalizeText(`${item.department || ''} ${item.family || ''} ${item.subfamily || ''} ${item.name || ''}`);
+  if (/(BOX|KIT|POD|CLEAROMISEUR|ATOMISEUR|MOD\b|BATTERIE|ACCU|CHARGEUR|DRIP|ETUI|MATERIEL)/.test(text)) return 'Matériel';
+  if (/(RESISTANCE|CARTOUCHE|COIL|PYREX|CABLE|ACCESSOIRE)/.test(text)) return 'Consommables matériel';
+  if (/(DIY|AROME|BASE|CONCENTRE)/.test(text)) return 'DIY';
+  if (/(E[- ]?LIQUID|10ML|20ML|30ML|40ML|50ML|60ML|100ML|BOOSTER|SALT|SEL DE NICOTINE)/.test(text)) return 'E-liquides';
+  return 'Autres';
+}
+
+function productFormat(product) {
+  const text = normalizeText(`${product.name || ''} ${product.family || ''} ${product.subfamily || ''}`);
+  for (const volume of ['10', '20', '30', '40', '50', '60', '70', '80', '100', '200']) {
+    if (new RegExp(`(^|[^0-9])${volume}\\s*ML([^0-9]|$)`).test(text)) return `${volume}ML`;
+  }
+  return 'UNITÉ';
+}
+
+function receiptAgeMetrics(code, currentStock, receipts, referenceDate) {
+  if (currentStock <= 0) return { knownQty: 0, unknownQty: 0, weightedAge: 0, oldestKnown: null, newestKnown: null, confidence: 1 };
+  const rows = receipts.filter(r => r.code === code && r.quantityReceived > 0 && (r.validatedAt || r.createdAt))
+    .sort((a, b) => new Date(b.validatedAt || b.createdAt) - new Date(a.validatedAt || a.createdAt));
+  let remaining = currentStock;
+  let weighted = 0;
+  let knownQty = 0;
+  const retained = [];
+  for (const row of rows) {
+    if (remaining <= 0) break;
+    const qty = Math.min(remaining, row.quantityReceived);
+    const date = parseDate(row.validatedAt || row.createdAt);
+    if (date && qty > 0) {
+      retained.push(date);
+      weighted += qty * Math.max(0, daysBetween(date, referenceDate));
+      knownQty += qty;
+    }
+    remaining -= qty;
+  }
+  return {
+    knownQty, unknownQty: Math.max(0, remaining), weightedAge: safeDiv(weighted, knownQty),
+    oldestKnown: retained.length ? new Date(Math.min(...retained)) : null,
+    newestKnown: retained.length ? new Date(Math.max(...retained)) : null,
+    confidence: safeDiv(knownQty, Math.max(1, currentStock))
+  };
+}
+
+function plainRegularity(xyz, variability, weeks) {
+  if (weeks < 3) return 'Historique insuffisant';
+  if (xyz === 'X') return 'Vente régulière';
+  if (xyz === 'Y') return 'Vente variable / saisonnière';
+  return variability === Infinity ? 'Vente rare' : 'Vente irrégulière';
+}
+
+function statusExplanation(row, settings) {
+  const targetCoverageDays = Number(settings.targetCoverageDays) || 28;
+  switch (row.status) {
+    case 'Stock négatif': return `Le stock affiché est ${row.stock}. Une correction d’inventaire est nécessaire avant toute commande.`;
+    case 'Rupture récente': return `${row.recentQty} unité(s) vendue(s) sur les 30 derniers jours, mais le stock est actuellement nul.`;
+    case 'À commander maintenant': return `${row.coverageDays.toFixed(1)} jour(s) de couverture, sous l’objectif de ${targetCoverageDays} jours.`;
+    case 'Stock immobilisé': return `${row.stockValue.toFixed(2)} € HT immobilisés et aucune vente observée depuis ${row.daysSinceSale ?? 'une durée inconnue'} jours.`;
+    case 'Dormant': return `La dernière vente remonte à ${row.daysSinceSale} jours, avec ${row.stock} unité(s) encore en stock.`;
+    case 'Vente ralentie': return `La référence vend encore, mais son rythme récent ralentit et sa dernière vente remonte à ${row.daysSinceSale} jours.`;
+    case 'Surstock': return `${row.coverageDays.toFixed(0)} jours de couverture, soit plus de trois fois l’objectif.`;
+    case 'Produit essentiel': return `Forte contribution à la marge, ventes régulières et rotation élevée. La rupture doit être évitée.`;
+    case 'Forte marge à développer': return `Taux de marque élevé (${(row.markupRate * 100).toFixed(1)} %) mais volume inférieur aux meilleures références.`;
+    case 'Produit de trafic': return `Volume élevé et rotation forte, avec une marge relative plus faible. Il contribue à la fréquentation.`;
+    case 'Vente régulière': return `Ventes stables, stock cohérent et couverture maîtrisée.`;
+    case 'Vente irrégulière': return `La référence se vend, mais de façon irrégulière. La commande doit rester prudente.`;
+    default: return `Données encore insuffisantes pour établir un comportement robuste.`;
+  }
+}
+
+function productStats(data, selectedSales, previousSales, productMap, referenceDate, periodStart, settings = {}) {
+  const dormantDays = Number(settings.dormantDays) || 45;
+  const criticalDormantDays = Number(settings.criticalDormantDays) || 90;
+  const targetCoverageDays = Number(settings.targetCoverageDays) || 28;
+  const selectedByCode = groupBy(selectedSales, r => r.code);
+  const previousByCode = groupBy(previousSales, r => r.code);
+  const allByCode = groupBy(data.sales, r => r.code);
+  const receiptsByCode = groupBy(data.receipts, r => r.code);
+  const periodDays = Math.max(1, daysBetween(periodStart, referenceDate) + 1);
+  const rows = [];
+  const dataExtent = dateExtent(data.sales);
+  for (const [code, product] of productMap) {
+    const sales = selectedByCode.get(code) || [];
+    const prevSales = previousByCode.get(code) || [];
+    const allSales = allByCode.get(code) || [];
+    const fins = sales.map(r => lineFinancials(r, productMap));
+    const prevFins = prevSales.map(r => lineFinancials(r, productMap));
+    const revenueTTC = sum(fins.map(x => x.revenueTTC));
+    const revenueHT = sum(fins.map(x => x.revenueHT));
+    const costHT = sum(fins.map(x => x.costHT));
+    const marginHT = revenueHT - costHT;
+    const previousRevenueTTC = sum(prevFins.map(x => x.revenueTTC));
+    const previousRevenueHT = sum(prevFins.map(x => x.revenueHT));
+    const previousMarginHT = sum(prevFins.map(x => x.marginHT));
+    const quantity = sum(sales.map(r => r.quantity));
+    const positiveQty = sum(sales.filter(r => r.quantity > 0).map(r => r.quantity));
+    const previousQty = sum(prevSales.filter(r => r.quantity > 0).map(r => r.quantity));
+    const allPositive = allSales.filter(r => r.quantity > 0 && parseDate(r.date));
+    const lastSale = allPositive.length ? new Date(Math.max(...allPositive.map(r => +parseDate(r.date)))) : null;
+    const firstSale = allPositive.length ? new Date(Math.min(...allPositive.map(r => +parseDate(r.date)))) : null;
+    const daysSinceSale = lastSale ? Math.max(0, daysBetween(lastSale, referenceDate)) : null;
+    const recentStart = addDays(referenceDate, -29);
+    const recentQty = sum(allPositive.filter(r => parseDate(r.date) >= recentStart && parseDate(r.date) <= referenceDate).map(r => r.quantity));
+    const availableDays = dataExtent.min ? clamp(daysBetween(dataExtent.min, referenceDate) + 1, 1, 30) : 30;
+    const dailyVelocity = recentQty / availableDays;
+    const stock = toNumber(product.stock);
+    const coverageDays = dailyVelocity > 0 ? stock / dailyVelocity : (stock > 0 ? Infinity : 0);
+    const stockValueHT = Number.isFinite(product.stockValue) ? product.stockValue : stock * toNumber(product.averageCost);
+    const stockRetailHT = Number.isFinite(product.marketValueHT) ? product.marketValueHT : stock * toNumber(product.priceHT);
+    const stockRetailTTC = Number.isFinite(product.marketValueTTC) ? product.marketValueTTC : stock * toNumber(product.priceTTC);
+    const age = receiptAgeMetrics(code, stock, receiptsByCode.get(code) || [], referenceDate);
+    const weekly = new Map();
+    for (const r of sales.filter(x => x.quantity > 0)) {
+      const d = parseDate(r.date);
+      if (!d) continue;
+      const monday = new Date(d);
+      monday.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+      const key = isoDate(monday);
+      weekly.set(key, (weekly.get(key) || 0) + r.quantity);
+    }
+    const weekValues = [...weekly.values()];
+    const cv = mean(weekValues) ? stddev(weekValues) / mean(weekValues) : Infinity;
+    const xyz = weekValues.length < 3 || positiveQty < 3 ? 'Z' : cv <= .5 ? 'X' : cv <= 1 ? 'Y' : 'Z';
+    rows.push({
+      code, name: product.name || sales[0]?.name || code,
+      department: product.department || sales[0]?.department || 'NON CLASSÉ',
+      family: product.family || sales[0]?.family || '', subfamily: product.subfamily || sales[0]?.subfamily || '',
+      supplier: product.supplier || '', segment: commercialSegment(product), format: productFormat(product),
+      stock, stockValueHT, stockValue: stockValueHT, stockRetailHT, stockRetailTTC,
+      averageCostHT: toNumber(product.averageCost), averageCost: toNumber(product.averageCost), lastCostHT: toNumber(product.lastCost),
+      priceHT: toNumber(product.priceHT), priceTTC: toNumber(product.priceTTC), unitMarginHT: toNumber(product.unitMargin), unitMargin: toNumber(product.unitMargin), markupRateCurrent: toNumber(product.markupRate),
+      revenueTTC, revenueHT, revenue: revenueTTC, costHT, cost: costHT, marginHT, margin: marginHT,
+      previousRevenueTTC, previousRevenueHT, previousMarginHT, revenueChangeTTC: revenueTTC - previousRevenueTTC,
+      quantity, positiveQty, previousQty, quantityChange: positiveQty - previousQty,
+      tickets: new Set(sales.map(ticketKey)).size,
+      customers: new Set(sales.filter(r => r.customerName).map(r => normalizeText(r.customerName))).size,
+      marginRate: safeDiv(marginHT, costHT), markupRate: safeDiv(marginHT, revenueHT), marginPerStockEuro: safeDiv(marginHT, stockValueHT),
+      sellThroughProxy: safeDiv(positiveQty, positiveQty + Math.max(stock, 0)),
+      firstSale, lastSale, daysSinceSale, recentQty, dailyVelocity, coverageDays,
+      xyz, variability: cv, regularity: plainRegularity(xyz, cv, weekValues.length), age,
+      historicalOnly: !!product.historicalOnly, periodDays
+    });
+  }
+  const ranked = [...rows].sort((a, b) => b.marginHT - a.marginHT);
+  const totalMargin = sum(ranked.map(r => Math.max(0, r.marginHT)));
+  let cumulative = 0;
+  for (const row of ranked) {
+    cumulative += Math.max(0, row.marginHT);
+    const share = safeDiv(cumulative, totalMargin);
+    row.abc = share <= .8 ? 'A' : share <= .95 ? 'B' : 'C';
+  }
+  const qtyQ75 = quantile(rows.map(r => r.positiveQty), .75);
+  const marginQ75 = quantile(rows.map(r => r.markupRate).filter(Number.isFinite), .75);
+  for (const row of rows) {
+    if (row.stock < 0) row.status = 'Stock négatif';
+    else if (row.stock <= 0 && row.recentQty > 0) row.status = 'Rupture récente';
+    else if (row.stock > 0 && (row.daysSinceSale == null || row.daysSinceSale >= criticalDormantDays)) row.status = 'Stock immobilisé';
+    else if (row.stock > 0 && row.daysSinceSale >= dormantDays) row.status = 'Dormant';
+    else if (row.stock > 0 && row.daysSinceSale >= Math.max(15, Math.round(dormantDays * .65))) row.status = 'Vente ralentie';
+    else if (row.coverageDays !== Infinity && row.coverageDays < targetCoverageDays * .35 && row.recentQty > 0) row.status = 'À commander maintenant';
+    else if (row.coverageDays > targetCoverageDays * 3.2 && row.recentQty > 0) row.status = 'Surstock';
+    else if (row.abc === 'A' && row.xyz === 'X' && row.markupRate >= marginQ75) row.status = 'Produit essentiel';
+    else if (row.markupRate >= marginQ75 && row.positiveQty < qtyQ75) row.status = 'Forte marge à développer';
+    else if (row.positiveQty >= qtyQ75 && row.markupRate < marginQ75) row.status = 'Produit de trafic';
+    else if (row.xyz === 'X' && row.positiveQty > 0) row.status = 'Vente régulière';
+    else if (row.positiveQty > 0) row.status = 'Vente irrégulière';
+    else row.status = 'Données insuffisantes';
+    row.statusReason = statusExplanation(row, settings);
+    row.role = row.status === 'Produit essentiel' ? 'Essentiel au résultat' : row.status === 'Produit de trafic' ? 'Génère du passage' : row.status === 'Forte marge à développer' ? 'Potentiel de marge' : row.regularity;
+    const dormantRisk = row.stockValueHT * clamp((row.daysSinceSale || 0) / 90, 0, 1.5);
+    const ruptureOpportunity = row.stock <= 0 ? Math.max(0, row.marginHT) * .3 + row.recentQty * Math.max(0, row.unitMarginHT) : 0;
+    row.priorityScore = dormantRisk + ruptureOpportunity + (row.stock < 0 ? 500 : 0);
+  }
+  return rows.sort((a, b) => b.priorityScore - a.priorityScore);
+}
+
+function ticketSegmentStats(visits) {
+  const stats = new Map();
+  let totalTTC = 0;
+  for (const visit of visits) {
+    for (const line of visit.lines.filter(x => x.quantity > 0)) {
+      const segment = commercialSegment(line);
+      const value = Math.max(0, toNumber(line.saleTTC));
+      totalTTC += value;
+      stats.set(segment, (stats.get(segment) || 0) + value);
+    }
+  }
+  return Object.fromEntries([...stats].map(([key, value]) => [key, safeDiv(value, totalTTC)]));
+}
+
+function customerBehavior(visits) {
+  if (!visits.length) return { basketDelta: null, materialShareDelta: null, frequencyDelta: null, recentBasketTTC: 0, priorBasketTTC: 0, changes: [], recurringNeeds: [] };
+  const split = Math.max(1, Math.floor(visits.length / 2));
+  const prior = visits.slice(0, split);
+  const recent = visits.slice(split);
+  const priorBasketTTC = mean(prior.map(v => v.revenueTTC));
+  const recentBasketTTC = mean(recent.map(v => v.revenueTTC));
+  const priorBasketHT = mean(prior.map(v => v.revenueHT));
+  const recentBasketHT = mean(recent.map(v => v.revenueHT));
+  const priorSegments = ticketSegmentStats(prior);
+  const recentSegments = ticketSegmentStats(recent);
+  const materialBefore = (priorSegments['Matériel'] || 0) + (priorSegments['Consommables matériel'] || 0);
+  const materialNow = (recentSegments['Matériel'] || 0) + (recentSegments['Consommables matériel'] || 0);
+  const gaps = visits.slice(1).map((v, i) => Math.max(0, daysBetween(visits[i].date, v.date))).filter(Boolean);
+  const gapSplit = Math.max(1, Math.floor(gaps.length / 2));
+  const oldGap = mean(gaps.slice(0, gapSplit));
+  const newGap = mean(gaps.slice(gapSplit));
+  const changes = [];
+  const basketDelta = priorBasketTTC ? (recentBasketTTC - priorBasketTTC) / priorBasketTTC : null;
+  const materialShareDelta = materialNow - materialBefore;
+  const frequencyDelta = oldGap ? (newGap - oldGap) / oldGap : null;
+  if (basketDelta != null && Math.abs(basketDelta) >= .15) changes.push({ type: 'basket', direction: basketDelta > 0 ? 'up' : 'down', value: basketDelta, label: `Panier ${basketDelta > 0 ? 'en hausse' : 'en baisse'} de ${Math.abs(basketDelta * 100).toFixed(0)} %` });
+  if (Math.abs(materialShareDelta) >= .12) changes.push({ type: 'material', direction: materialShareDelta > 0 ? 'up' : 'down', value: materialShareDelta, label: `Part matériel ${materialShareDelta > 0 ? 'en hausse' : 'en baisse'} de ${Math.abs(materialShareDelta * 100).toFixed(0)} points` });
+  if (frequencyDelta != null && Math.abs(frequencyDelta) >= .25) changes.push({ type: 'frequency', direction: frequencyDelta < 0 ? 'up' : 'down', value: frequencyDelta, label: `Rythme de visite ${frequencyDelta < 0 ? 'plus fréquent' : 'plus lent'} de ${Math.abs(frequencyDelta * 100).toFixed(0)} %` });
+  const allSegments = new Set([...Object.keys(priorSegments), ...Object.keys(recentSegments)]);
+  for (const segment of allSegments) {
+    const delta = (recentSegments[segment] || 0) - (priorSegments[segment] || 0);
+    if (Math.abs(delta) >= .18) changes.push({ type: 'segment', direction: delta > 0 ? 'up' : 'down', value: delta, label: `${segment} ${delta > 0 ? 'progresse' : 'recule'} de ${Math.abs(delta * 100).toFixed(0)} points dans ses achats` });
+  }
+  const productDates = new Map();
+  for (const visit of visits) for (const line of visit.lines.filter(x => x.quantity > 0)) {
+    if (!productDates.has(line.code)) productDates.set(line.code, { code: line.code, name: line.name, dates: [], quantities: [] });
+    productDates.get(line.code).dates.push(visit.date);
+    productDates.get(line.code).quantities.push(line.quantity);
+  }
+  const lastDate = visits.at(-1).date;
+  const recurringNeeds = [];
+  for (const item of productDates.values()) {
+    if (item.dates.length < 2) continue;
+    const intervals = item.dates.slice(1).map((d, i) => daysBetween(item.dates[i], d)).filter(x => x > 0);
+    if (!intervals.length) continue;
+    const expected = median(intervals);
+    const elapsed = daysBetween(item.dates.at(-1), lastDate);
+    recurringNeeds.push({ code: item.code, name: item.name, expectedDays: expected, averageQuantity: mean(item.quantities), lastPurchase: item.dates.at(-1), overdueAtReference: elapsed > expected * 1.4 });
+  }
+  return { basketDelta, materialShareDelta, frequencyDelta, recentBasketTTC, priorBasketTTC, recentBasketHT, priorBasketHT, materialShareNow: materialNow, materialShareBefore: materialBefore, changes: changes.slice(0, 6), recurringNeeds: recurringNeeds.sort((a, b) => b.expectedDays - a.expectedDays).slice(0, 8) };
+}
+
+function customerStats(data, selectedTickets, productMap, referenceDate, start, end) {
+  const allTickets = groupTickets(data.sales, productMap).filter(t => normalizeText(t.customer));
+  const selectedKeys = new Set(selectedTickets.map(t => t.key));
+  const byName = groupBy(allTickets, t => normalizeText(t.customer));
+  const clientIndex = indexBy(data.clients, c => normalizeText(c.name));
+  const rows = [];
+  for (const [name, visitsRaw] of byName) {
+    const visits = [...visitsRaw].sort((a, b) => a.date - b.date);
+    const selected = visits.filter(v => selectedKeys.has(v.key));
+    const first = visits[0].date;
+    const last = visits.at(-1).date;
+    const gaps = visits.slice(1).map((v, i) => Math.max(0, daysBetween(visits[i].date, v.date))).filter(Boolean);
+    const avgGap = mean(gaps);
+    const medianGap = median(gaps);
+    const expectedGap = medianGap || avgGap || (visits.length === 1 ? 45 : 30);
+    const gapCv = avgGap ? stddev(gaps) / avgGap : 1;
+    const recency = Math.max(0, daysBetween(last, referenceDate));
+    const lateness = recency - expectedGap;
+    const ratio = safeDiv(recency, expectedGap, recency > 0 ? 3 : 0);
+    const selectedRevenueTTC = sum(selected.map(v => v.revenueTTC));
+    const selectedRevenueHT = sum(selected.map(v => v.revenueHT));
+    const selectedMarginHT = sum(selected.map(v => v.marginHT));
+    const selectedItems = sum(selected.map(v => v.items));
+    const allRevenueTTC = sum(visits.map(v => v.revenueTTC));
+    const allRevenueHT = sum(visits.map(v => v.revenueHT));
+    const allMarginHT = sum(visits.map(v => v.marginHT));
+    const productCounts = new Map();
+    const familyCounts = new Map();
+    const sellerCounts = new Map();
+    for (const visit of visits) {
+      sellerCounts.set(visit.seller, (sellerCounts.get(visit.seller) || 0) + 1);
+      for (const line of visit.lines.filter(x => x.quantity > 0)) {
+        productCounts.set(line.name, (productCounts.get(line.name) || 0) + line.quantity);
+        familyCounts.set(line.family || 'NON CLASSÉ', (familyCounts.get(line.family || 'NON CLASSÉ') || 0) + line.quantity);
+      }
+    }
+    const favorite = map => [...map.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || '—';
+    let status = 'Actif';
+    if (visits.length === 1 && recency <= 45) status = 'Nouveau';
+    else if (visits.length === 1 && recency > 45) status = 'Premier achat sans retour';
+    else if (ratio >= 3 && recency >= 90) status = 'Probablement perdu';
+    else if (ratio >= 1.8 && recency >= 45) status = 'À risque';
+    else if (ratio >= 1.25 && lateness >= 7) status = 'En retard';
+    else if (visits.length >= 12) status = 'VIP';
+    else if (visits.length >= 6) status = 'Fidèle';
+    const confidence = clamp((visits.length - 1) / 6, .25, 1) * clamp(1 - gapCv / 2, .35, 1);
+    const riskBase = 1 / (1 + Math.exp(-2.3 * (ratio - 1.35)));
+    const riskProbability = clamp((visits.length === 1 ? (recency > 45 ? .55 : .18) : riskBase) * (.65 + .35 * confidence), 0, .99);
+    const profile = clientIndex.get(name) || {};
+    const behavior = customerBehavior(visits);
+    const reasons = [];
+    if (visits.length === 1) reasons.push(recency > 45 ? `Aucun deuxième achat observé depuis ${recency} jours.` : `Premier achat récent : le rythme n’est pas encore établi.`);
+    else {
+      if (lateness > 0) reasons.push(`Retour attendu environ tous les ${Math.round(expectedGap)} jours ; retard actuel de ${Math.max(0, Math.round(lateness))} jours.`);
+      if (gapCv > .8) reasons.push(`Rythme d’achat irrégulier : la prévision est moins certaine.`);
+    }
+    if (behavior.basketDelta != null && behavior.basketDelta <= -.2) reasons.push(`Son panier récent a baissé de ${Math.abs(behavior.basketDelta * 100).toFixed(0)} %.`);
+    if (behavior.frequencyDelta != null && behavior.frequencyDelta >= .3) reasons.push(`L’intervalle entre ses visites s’est allongé de ${Math.abs(behavior.frequencyDelta * 100).toFixed(0)} %.`);
+    if (behavior.materialShareDelta <= -.15) reasons.push(`La part de matériel et consommables a reculé de ${Math.abs(behavior.materialShareDelta * 100).toFixed(0)} points.`);
+    if (!reasons.length) reasons.push(`Comportement cohérent avec son historique d’achat.`);
+    rows.push({
+      name, code: profile.code || '', title: profile.title || '', city: profile.city || '', zip: profile.zip || '', country: profile.country || '', age: profile.age,
+      birthday: profile.birthday || '', profession: profile.profession || '', phone: profile.phone || '', email: profile.email || '',
+      consent: normalizeText(profile.commercialConsent).includes('ACCORD'), commercialConsent: profile.commercialConsent || '',
+      firstVisit: first, lastVisit: last, visits: visits.length, selectedVisits: selected.length, recency, avgGap, medianGap, expectedGap,
+      expectedNext: addDays(last, Math.round(expectedGap)), lateness, gapCv,
+      revenueTTC: selectedRevenueTTC, revenueHT: selectedRevenueHT, marginHT: selectedMarginHT, revenue: selectedRevenueTTC, margin: selectedMarginHT,
+      lifetimeRevenueTTC: allRevenueTTC, lifetimeRevenueHT: allRevenueHT, lifetimeMarginHT: allMarginHT,
+      lifetimeRevenue: allRevenueTTC, lifetimeMargin: allMarginHT,
+      averageBasketTTC: safeDiv(selectedRevenueTTC, selected.length), averageBasketHT: safeDiv(selectedRevenueHT, selected.length), averageBasket: safeDiv(selectedRevenueTTC, selected.length),
+      lifetimeAverageBasketTTC: safeDiv(allRevenueTTC, visits.length), lifetimeAverageBasketHT: safeDiv(allRevenueHT, visits.length),
+      itemsPerVisit: safeDiv(selectedItems, selected.length),
+      favoriteProduct: favorite(productCounts), favoriteFamily: favorite(familyCounts), favoriteSeller: favorite(sellerCounts),
+      status, riskProbability, riskConfidence: confidence, riskScore: riskProbability * Math.max(20, allMarginHT), riskReasons: reasons, behavior,
+      visitsList: visits, activeInPeriod: selected.length > 0, beforePeriod: visits.some(v => start && v.date < start),
+      periodStart: start, periodEnd: end
+    });
+  }
+  const recencies = rows.map(r => r.recency);
+  const freqs = rows.map(r => r.visits);
+  const amounts = rows.map(r => r.lifetimeMarginHT);
+  const thresholds = arr => [quantile(arr, .2), quantile(arr, .4), quantile(arr, .6), quantile(arr, .8)];
+  const rt = thresholds(recencies); const ft = thresholds(freqs); const mt = thresholds(amounts);
+  const scoreHigh = (v, t) => 1 + t.filter(x => v > x).length;
+  const scoreLow = (v, t) => 5 - t.filter(x => v > x).length;
+  for (const row of rows) row.rfm = `${scoreLow(row.recency, rt)}${scoreHigh(row.visits, ft)}${scoreHigh(row.lifetimeMarginHT, mt)}`;
+  return rows.sort((a, b) => b.riskScore - a.riskScore);
+}
+
+function revisitAnalysis(data, productMap, referenceDate) {
+  const tickets = groupTickets(data.sales, productMap).filter(t => normalizeText(t.customer));
+  const by = groupBy(tickets, t => normalizeText(t.customer));
+  const horizons = [7, 14, 30, 60, 90, 180, 365];
+  return horizons.map(days => {
+    let eligible = 0;
+    let returned = 0;
+    for (const visitsRaw of by.values()) {
+      const visits = [...visitsRaw].sort((a, b) => a.date - b.date);
+      const first = visits[0].date;
+      if (daysBetween(first, referenceDate) < days) continue;
+      eligible += 1;
+      if (visits.slice(1).some(v => daysBetween(first, v.date) <= days)) returned += 1;
+    }
+    return { days, eligible, returned, rate: safeDiv(returned, eligible) };
+  });
+}
+
+function cohortAnalysis(data, productMap, referenceDate) {
+  const tickets = groupTickets(data.sales, productMap).filter(t => normalizeText(t.customer));
+  const by = groupBy(tickets, t => normalizeText(t.customer));
+  const cohorts = new Map();
+  for (const visitsRaw of by.values()) {
+    const visits = [...visitsRaw].sort((a, b) => a.date - b.date);
+    const first = visits[0].date;
+    const key = isoDate(first).slice(0, 7);
+    if (!cohorts.has(key)) cohorts.set(key, { cohort: key, customers: 0, revenueTTC: 0, revenueHT: 0, marginHT: 0, retained30: 0, eligible30: 0, retained60: 0, eligible60: 0, retained90: 0, eligible90: 0 });
+    const c = cohorts.get(key);
+    c.customers += 1;
+    c.revenueTTC += sum(visits.map(v => v.revenueTTC));
+    c.revenueHT += sum(visits.map(v => v.revenueHT));
+    c.marginHT += sum(visits.map(v => v.marginHT));
+    for (const h of [30, 60, 90]) {
+      if (daysBetween(first, referenceDate) >= h) {
+        c[`eligible${h}`] += 1;
+        if (visits.slice(1).some(v => daysBetween(first, v.date) <= h)) c[`retained${h}`] += 1;
+      }
+    }
+  }
+  return [...cohorts.values()].sort((a, b) => b.cohort.localeCompare(a.cohort)).map(c => ({
+    ...c, revenue: c.revenueTTC, margin: c.marginHT,
+    rate30: safeDiv(c.retained30, c.eligible30), rate60: safeDiv(c.retained60, c.eligible60), rate90: safeDiv(c.retained90, c.eligible90)
+  }));
+}
+
+function customerFlows(data, productMap, start, end, prev, customers) {
+  const allTickets = groupTickets(data.sales, productMap).filter(t => normalizeText(t.customer));
+  const currentTickets = allTickets.filter(t => inPeriod(t.date, start, end));
+  const previousTickets = prev ? allTickets.filter(t => inPeriod(t.date, prev.start, prev.end)) : [];
+  const currentNames = new Set(currentTickets.map(t => normalizeText(t.customer)));
+  const previousNames = new Set(previousTickets.map(t => normalizeText(t.customer)));
+  const beforeStart = groupBy(allTickets.filter(t => start && t.date < start), t => normalizeText(t.customer));
+  const currentBy = groupBy(currentTickets, t => normalizeText(t.customer));
+  const previousBy = groupBy(previousTickets, t => normalizeText(t.customer));
+  const newCustomers = [...currentNames].filter(name => !beforeStart.has(name));
+  const retained = [...currentNames].filter(name => beforeStart.has(name));
+  const nonReturnedNames = [...previousNames].filter(name => !currentNames.has(name));
+  const customerIndex = indexBy(customers, c => normalizeText(c.name));
+  const sumTickets = tickets => ({ ttc: sum(tickets.map(t => t.revenueTTC)), ht: sum(tickets.map(t => t.revenueHT)), margin: sum(tickets.map(t => t.marginHT)) });
+  const nonReturned = nonReturnedNames.map(name => {
+    const c = customerIndex.get(name) || {};
+    const prevStats = sumTickets(previousBy.get(name) || []);
+    return { ...c, name: c.name || previousBy.get(name)?.[0]?.customer || name, previousRevenueTTC: prevStats.ttc, previousRevenueHT: prevStats.ht, previousMarginHT: prevStats.margin };
+  }).sort((a, b) => b.previousRevenueTTC - a.previousRevenueTTC);
+  const newStats = sumTickets(newCustomers.flatMap(name => currentBy.get(name) || []));
+  const retainedStats = sumTickets(retained.flatMap(name => currentBy.get(name) || []));
+  const lostStats = sumTickets(nonReturnedNames.flatMap(name => previousBy.get(name) || []));
+  return {
+    newCount: newCustomers.length, retainedCount: retained.length, nonReturnedCount: nonReturned.length,
+    newRevenueTTC: newStats.ttc, newRevenueHT: newStats.ht, newMarginHT: newStats.margin,
+    retainedRevenueTTC: retainedStats.ttc, retainedRevenueHT: retainedStats.ht, retainedMarginHT: retainedStats.margin,
+    nonReturnedRevenueTTC: lostStats.ttc, nonReturnedRevenueHT: lostStats.ht, nonReturnedMarginHT: lostStats.margin,
+    nonReturned, newNames: newCustomers, retainedNames: retained
+  };
+}
+
+function demographics(data, customers, selectedTickets) {
+  const activeNames = new Set(selectedTickets.filter(t => normalizeText(t.customer)).map(t => normalizeText(t.customer)));
+  const customerByName = indexBy(customers, c => normalizeText(c.name));
+  const profiles = data.clients.map(profile => customerByName.get(normalizeText(profile.name)) || {
+    name: profile.name, age: profile.age, city: profile.city, zip: profile.zip, lifetimeRevenueTTC: 0, lifetimeRevenueHT: 0, lifetimeMarginHT: 0, visits: 0
+  });
+  const active = profiles.filter(c => activeNames.has(normalizeText(c.name)));
+  const ageBands = [
+    { label: 'Moins de 25 ans', min: 0, max: 24 }, { label: '25–34 ans', min: 25, max: 34 },
+    { label: '35–44 ans', min: 35, max: 44 }, { label: '45–54 ans', min: 45, max: 54 },
+    { label: '55–64 ans', min: 55, max: 64 }, { label: '65 ans et plus', min: 65, max: 200 },
+    { label: 'Âge inconnu', min: null, max: null }
+  ].map(band => {
+    const rows = band.min == null ? profiles.filter(c => !Number.isFinite(c.age)) : profiles.filter(c => Number.isFinite(c.age) && c.age >= band.min && c.age <= band.max);
+    const actives = rows.filter(c => activeNames.has(normalizeText(c.name)));
+    return {
+      label: band.label, customers: rows.length, activeCustomers: actives.length,
+      revenueTTC: sum(actives.map(c => c.revenueTTC || 0)), revenueHT: sum(actives.map(c => c.revenueHT || 0)), marginHT: sum(actives.map(c => c.marginHT || 0)),
+      averageBasketTTC: mean(actives.map(c => c.averageBasketTTC).filter(Number.isFinite))
+    };
+  });
+  const cityMap = new Map();
+  for (const c of profiles) {
+    const city = c.city || 'VILLE INCONNUE';
+    if (!cityMap.has(city)) cityMap.set(city, { city, customers: 0, activeCustomers: 0, revenueTTC: 0, revenueHT: 0, marginHT: 0, visits: 0 });
+    const row = cityMap.get(city);
+    row.customers += 1;
+    if (activeNames.has(normalizeText(c.name))) {
+      row.activeCustomers += 1;
+      row.revenueTTC += c.revenueTTC || 0;
+      row.revenueHT += c.revenueHT || 0;
+      row.marginHT += c.marginHT || 0;
+      row.visits += c.selectedVisits || 0;
+    }
+  }
+  const cities = [...cityMap.values()].map(c => ({ ...c, averageRevenueTTC: safeDiv(c.revenueTTC, c.activeCustomers), averageVisits: safeDiv(c.visits, c.activeCustomers) })).sort((a, b) => b.activeCustomers - a.activeCustomers);
+  const knownAges = profiles.map(c => c.age).filter(Number.isFinite);
+  return {
+    portfolioClients: profiles.length, activeProfiles: active.length,
+    averageAge: mean(knownAges), medianAge: median(knownAges), ageCoverage: safeDiv(knownAges.length, profiles.length),
+    cityCoverage: safeDiv(profiles.filter(c => normalizeText(c.city)).length, profiles.length), ageBands, cities
+  };
+}
+
+function sellerStats(selectedTickets, previousTickets = []) {
+  const by = groupBy(selectedTickets, t => t.seller || 'NON RENSEIGNÉ');
+  const prevBy = groupBy(previousTickets, t => t.seller || 'NON RENSEIGNÉ');
+  const rows = [];
+  for (const [seller, tickets] of by) {
+    const revenueTTC = sum(tickets.map(t => t.revenueTTC));
+    const revenueHT = sum(tickets.map(t => t.revenueHT));
+    const marginHT = sum(tickets.map(t => t.marginHT));
+    const prevTickets = prevBy.get(seller) || [];
+    const prevRevenueTTC = sum(prevTickets.map(t => t.revenueTTC));
+    const materialTickets = tickets.filter(t => t.segments.has('Matériel') || t.segments.has('Consommables matériel'));
+    rows.push({
+      seller, revenueTTC, revenueHT, revenue: revenueTTC, marginHT, margin: marginHT,
+      previousRevenueTTC: prevRevenueTTC, revenueDelta: safeDiv(revenueTTC - prevRevenueTTC, Math.abs(prevRevenueTTC)),
+      tickets: tickets.length, averageBasketTTC: safeDiv(revenueTTC, tickets.length), averageBasketHT: safeDiv(revenueHT, tickets.length), averageBasket: safeDiv(revenueTTC, tickets.length),
+      itemsPerTicket: safeDiv(sum(tickets.map(t => Math.max(0, t.items))), tickets.length), marginPerTicketHT: safeDiv(marginHT, tickets.length), marginPerTicket: safeDiv(marginHT, tickets.length),
+      discountTTC: sum(tickets.map(t => t.discountTTC)), discountHT: sum(tickets.map(t => t.discountHT)), discountValue: sum(tickets.map(t => t.discountTTC)),
+      returns: tickets.filter(t => t.hasReturn).length, identifiedRate: safeDiv(tickets.filter(t => normalizeText(t.customer)).length, tickets.length),
+      uniqueCustomers: new Set(tickets.filter(t => t.customer).map(t => normalizeText(t.customer))).size,
+      multiFamilyRate: safeDiv(tickets.filter(t => t.families.size >= 2).length, tickets.length), materialTicketRate: safeDiv(materialTickets.length, tickets.length)
+    });
+  }
+  const avgMulti = mean(rows.map(r => r.multiFamilyRate));
+  const avgBasket = mean(rows.map(r => r.averageBasketTTC));
+  for (const row of rows) {
+    row.potentialTTC = Math.max(0, avgMulti - row.multiFamilyRate) * row.tickets * avgBasket;
+    row.potential = row.potentialTTC;
+    row.score = clamp(50 + (safeDiv(row.averageBasketTTC, avgBasket) - 1) * 25 + (safeDiv(row.multiFamilyRate, avgMulti) - 1) * 20 + (row.identifiedRate - .8) * 20, 0, 100);
+  }
+  return rows.sort((a, b) => b.marginHT - a.marginHT);
+}
+
+function basketAnalysis(tickets, productMap) {
+  const pairs = new Map();
+  const hours = Array.from({ length: 12 }, (_, i) => ({ hour: i + 8, tickets: 0, revenueTTC: 0, revenueHT: 0, revenue: 0, marginHT: 0, margin: 0 }));
+  const weekdays = ['Dimanche','Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi'].map((day, i) => ({ day, index: i, tickets: 0, revenueTTC: 0, revenueHT: 0, revenue: 0, marginHT: 0, margin: 0 }));
+  for (const ticket of tickets) {
+    if (ticket.date) {
+      const h = ticket.date.getHours();
+      const hb = hours.find(x => x.hour === h);
+      if (hb) {
+        hb.tickets += 1; hb.revenueTTC += ticket.revenueTTC; hb.revenueHT += ticket.revenueHT; hb.revenue += ticket.revenueTTC; hb.marginHT += ticket.marginHT; hb.margin += ticket.marginHT;
+      }
+      const wb = weekdays[ticket.date.getDay()];
+      wb.tickets += 1; wb.revenueTTC += ticket.revenueTTC; wb.revenueHT += ticket.revenueHT; wb.revenue += ticket.revenueTTC; wb.marginHT += ticket.marginHT; wb.margin += ticket.marginHT;
+    }
+    const codes = [...new Set(ticket.lines.filter(l => l.quantity > 0).map(l => l.code).filter(Boolean))].sort();
+    for (let i = 0; i < codes.length; i++) for (let j = i + 1; j < codes.length; j++) {
+      const key = `${codes[i]}|${codes[j]}`;
+      if (!pairs.has(key)) pairs.set(key, { a: codes[i], b: codes[j], count: 0, revenueTTC: 0, revenueHT: 0 });
+      const pair = pairs.get(key);
+      pair.count += 1; pair.revenueTTC += ticket.revenueTTC; pair.revenueHT += ticket.revenueHT;
+    }
+  }
+  const associations = [...pairs.values()].map(p => ({
+    ...p, revenue: p.revenueTTC, nameA: productMap.get(p.a)?.name || p.a, nameB: productMap.get(p.b)?.name || p.b, support: safeDiv(p.count, tickets.length)
+  })).sort((a, b) => b.count - a.count).slice(0, 100);
+  return { associations, hours, weekdays: weekdays.filter(x => x.index !== 0) };
+}
+
+function supplierStats(data, selectedReceipts, selectedSales, productMap) {
+  const productSupplier = new Map([...productMap].map(([code, p]) => [code, p.supplier || 'NON RENSEIGNÉ']));
+  const ordersBySupplier = groupBy(selectedReceipts, r => r.supplier || 'NON RENSEIGNÉ');
+  const salesBySupplier = groupBy(selectedSales, r => productSupplier.get(r.code) || 'NON RENSEIGNÉ');
+  const rows = [];
+  const suppliers = new Set([...ordersBySupplier.keys(), ...salesBySupplier.keys()]);
+  for (const supplier of suppliers) {
+    const receipts = ordersBySupplier.get(supplier) || [];
+    const sales = salesBySupplier.get(supplier) || [];
+    const orderGroups = groupBy(receipts, r => r.orderId);
+    let exact = 0, partial = 0, over = 0;
+    const delays = [];
+    for (const lines of orderGroups.values()) {
+      const qo = sum(lines.map(r => r.quantityOrdered)); const qr = sum(lines.map(r => r.quantityReceived));
+      if (Math.abs(qo - qr) < .001) exact += 1; else if (qr < qo) partial += 1; else over += 1;
+      const d0 = parseDate(lines[0].createdAt); const d1 = parseDate(lines[0].validatedAt);
+      if (d0 && d1) delays.push(daysBetween(d0, d1));
+    }
+    const fins = sales.map(r => lineFinancials(r, productMap));
+    const ordered = sum(receipts.map(r => r.quantityOrdered)); const received = sum(receipts.map(r => r.quantityReceived));
+    rows.push({
+      supplier, orders: orderGroups.size, lines: receipts.length, ordered, received, serviceRate: safeDiv(received, ordered), exact, partial, over, exactRate: safeDiv(exact, orderGroups.size),
+      purchaseSpendHT: sum(receipts.map(r => r.totalCost)), purchaseSpend: sum(receipts.map(r => r.totalCost)), avgValidationDays: mean(delays),
+      salesRevenueTTC: sum(fins.map(x => x.revenueTTC)), salesRevenueHT: sum(fins.map(x => x.revenueHT)), salesRevenue: sum(fins.map(x => x.revenueTTC)),
+      salesMarginHT: sum(fins.map(x => x.marginHT)), salesMargin: sum(fins.map(x => x.marginHT)),
+      stockValueHT: sum(data.stock.filter(p => (p.supplier || 'NON RENSEIGNÉ') === supplier).map(p => p.stockValue)), stockValue: sum(data.stock.filter(p => (p.supplier || 'NON RENSEIGNÉ') === supplier).map(p => p.stockValue))
+    });
+  }
+  return rows.sort((a, b) => b.purchaseSpendHT - a.purchaseSpendHT);
+}
+
+function movementStats(rows) {
+  const by = groupBy(rows, r => r.reason || 'NON RENSEIGNÉ');
+  return [...by].map(([reason, items]) => ({
+    reason, lines: items.length, quantity: sum(items.map(r => r.quantity)), impactHT: sum(items.map(r => r.totalCost)), impact: sum(items.map(r => r.totalCost)), products: new Set(items.map(r => r.code)).size
+  })).sort((a, b) => Math.abs(b.impactHT) - Math.abs(a.impactHT));
+}
+
+function dimensionDiff(currentLines, previousLines, productMap, keyFn) {
+  const aggregate = lines => {
+    const map = new Map();
+    for (const line of lines) {
+      const key = keyFn(line) || 'NON RENSEIGNÉ';
+      const fin = lineFinancials(line, productMap);
+      if (!map.has(key)) map.set(key, { key, revenueTTC: 0, revenueHT: 0, marginHT: 0, quantity: 0, lines: [] });
+      const row = map.get(key);
+      row.revenueTTC += fin.revenueTTC; row.revenueHT += fin.revenueHT; row.marginHT += fin.marginHT; row.quantity += line.quantity; row.lines.push(line);
+    }
+    return map;
+  };
+  const current = aggregate(currentLines); const previous = aggregate(previousLines);
+  const keys = new Set([...current.keys(), ...previous.keys()]);
+  return [...keys].map(key => {
+    const c = current.get(key) || { revenueTTC: 0, revenueHT: 0, marginHT: 0, quantity: 0, lines: [] };
+    const p = previous.get(key) || { revenueTTC: 0, revenueHT: 0, marginHT: 0, quantity: 0, lines: [] };
+    return {
+      key, revenueTTC: c.revenueTTC, previousRevenueTTC: p.revenueTTC, impactTTC: c.revenueTTC - p.revenueTTC,
+      revenueHT: c.revenueHT, previousRevenueHT: p.revenueHT, impactHT: c.revenueHT - p.revenueHT,
+      marginHT: c.marginHT, previousMarginHT: p.marginHT, marginImpactHT: c.marginHT - p.marginHT,
+      quantity: c.quantity, previousQuantity: p.quantity, lines: c.lines
+    };
+  }).sort((a, b) => Math.abs(b.impactTTC) - Math.abs(a.impactTTC));
+}
+
+function revenueDrivers(currentLines, previousLines, productMap, currentKpis, previousKpis, customerFlow) {
+  const changeTTC = currentKpis.revenueTTC - previousKpis.revenueTTC;
+  const changeHT = currentKpis.revenueHT - previousKpis.revenueHT;
+  const ticketEffectTTC = (currentKpis.tickets - previousKpis.tickets) * previousKpis.averageBasketTTC;
+  const basketEffectTTC = currentKpis.tickets * (currentKpis.averageBasketTTC - previousKpis.averageBasketTTC);
+  const ticketEffectHT = (currentKpis.tickets - previousKpis.tickets) * previousKpis.averageBasketHT;
+  const basketEffectHT = currentKpis.tickets * (currentKpis.averageBasketHT - previousKpis.averageBasketHT);
+  const families = dimensionDiff(currentLines, previousLines, productMap, line => line.family || line.department || 'NON CLASSÉ');
+  const products = dimensionDiff(currentLines, previousLines, productMap, line => `${line.code}|||${line.name || line.code}`);
+  const sellers = dimensionDiff(currentLines, previousLines, productMap, line => line.seller || 'NON RENSEIGNÉ');
+  const segments = dimensionDiff(currentLines, previousLines, productMap, line => commercialSegment(line));
+  const materialCurrent = segments.find(x => x.key === 'Matériel');
+  const consumableCurrent = segments.find(x => x.key === 'Consommables matériel');
+  const currentMaterialTTC = (materialCurrent?.revenueTTC || 0) + (consumableCurrent?.revenueTTC || 0);
+  const previousMaterialTTC = (materialCurrent?.previousRevenueTTC || 0) + (consumableCurrent?.previousRevenueTTC || 0);
+  const materialShareCurrent = safeDiv(currentMaterialTTC, currentKpis.revenueTTC);
+  const materialSharePrevious = safeDiv(previousMaterialTTC, previousKpis.revenueTTC);
+  const reasons = [];
+  if (Math.abs(ticketEffectTTC) > 1) reasons.push({ type: 'tickets', label: `${currentKpis.tickets - previousKpis.tickets >= 0 ? 'Plus' : 'Moins'} de tickets`, impactTTC: ticketEffectTTC, impactHT: ticketEffectHT, detail: `${currentKpis.tickets} tickets contre ${previousKpis.tickets}.`, drill: 'tickets' });
+  if (Math.abs(basketEffectTTC) > 1) reasons.push({ type: 'basket', label: `Panier moyen ${currentKpis.averageBasketTTC >= previousKpis.averageBasketTTC ? 'en hausse' : 'en baisse'}`, impactTTC: basketEffectTTC, impactHT: basketEffectHT, detail: `${currentKpis.averageBasketTTC.toFixed(2)} € TTC contre ${previousKpis.averageBasketTTC.toFixed(2)} € TTC.`, drill: 'baskets' });
+  for (const row of families.slice(0, 8)) if (Math.abs(row.impactTTC) > 1) reasons.push({ type: 'family', label: row.key, impactTTC: row.impactTTC, impactHT: row.impactHT, detail: `${row.revenueTTC.toFixed(2)} € TTC sur la période contre ${row.previousRevenueTTC.toFixed(2)} € TTC.`, drill: 'family', target: row.key });
+  reasons.sort((a, b) => Math.abs(b.impactTTC) - Math.abs(a.impactTTC));
+  return {
+    changeTTC, changeHT, changePct: safeDiv(changeTTC, Math.abs(previousKpis.revenueTTC)),
+    ticketEffectTTC, ticketEffectHT, basketEffectTTC, basketEffectHT,
+    currentTickets: currentKpis.tickets, previousTickets: previousKpis.tickets,
+    currentBasketTTC: currentKpis.averageBasketTTC, previousBasketTTC: previousKpis.averageBasketTTC,
+    currentBasketHT: currentKpis.averageBasketHT, previousBasketHT: previousKpis.averageBasketHT,
+    families, products, sellers, segments, reasons,
+    materialShareCurrent, materialSharePrevious, materialShareDelta: materialShareCurrent - materialSharePrevious,
+    customerFlow
+  };
+}
+
+function orderRules(settings = {}) {
+  const defaults = [
+    { supplierContains: 'OPENVAP', format: '10ML', pack: 10 }, { supplierContains: 'OPENVAP', format: '50ML', pack: 4 },
+    { supplierContains: 'FLAVOUR', format: '10ML', pack: 10 }, { supplierContains: 'FLAVOUR', format: '50ML', pack: 4 },
+    { supplierContains: 'AUVERGNE', format: '10ML', pack: 10 }, { supplierContains: 'AUVERGNE', format: '50ML', pack: 4 },
+    { supplierContains: 'FP', format: '10ML', pack: 10 }, { supplierContains: 'FP', format: '50ML', pack: 4 }
+  ];
+  return [...(Array.isArray(settings.orderRules) ? settings.orderRules : []), ...defaults];
+}
+
+function packSizeFor(product, settings) {
+  const supplier = normalizeText(product.supplier);
+  const name = normalizeText(product.name);
+  const format = product.format || productFormat(product);
+  const rule = orderRules(settings).find(r => {
+    const supplierMatch = !r.supplierContains || supplier.includes(normalizeText(r.supplierContains)) || name.includes(normalizeText(r.supplierContains));
+    return supplierMatch && (!r.format || normalizeText(r.format) === normalizeText(format));
+  });
+  return Math.max(1, Number(rule?.pack) || 1);
+}
+
+function roundToPack(value, pack) {
+  if (value <= 0) return 0;
+  return Math.ceil(value / pack) * pack;
+}
+
+function reorderAnalysis(products, settings, periodDays) {
+  const targetDays = Number(settings.orderTargetDays) || periodDays || 10;
+  const leadDays = Number(settings.orderLeadDays) || 3;
+  const safetyPct = Number(settings.orderSafetyPct ?? .15);
+  const lines = products.map(product => {
+    const packSize = packSizeFor(product, settings);
+    const averageDaily = safeDiv(product.positiveQty, periodDays);
+    const previousDaily = safeDiv(product.previousQty, periodDays);
+    const trend = previousDaily ? (averageDaily - previousDaily) / previousDaily : (averageDaily > 0 ? 1 : 0);
+    const minimumTarget = averageDaily * leadDays;
+    const recommendedTarget = averageDaily * targetDays;
+    const comfortTarget = recommendedTarget * (1 + safetyPct) * (trend > .25 ? Math.min(1.2, 1 + trend * .25) : 1);
+    const minimumOrder = roundToPack(minimumTarget - Math.max(0, product.stock), packSize);
+    const recommendedOrder = roundToPack(recommendedTarget - Math.max(0, product.stock), packSize);
+    const comfortOrder = roundToPack(comfortTarget - Math.max(0, product.stock), packSize);
+    const chosenOrder = recommendedOrder;
+    const stockAfter = product.stock + chosenOrder;
+    const coverageAfter = averageDaily > 0 ? stockAfter / averageDaily : Infinity;
+    const purchaseCostHT = chosenOrder * product.averageCostHT;
+    const retailValueHT = chosenOrder * product.priceHT;
+    const retailValueTTC = chosenOrder * product.priceTTC;
+    const marginPotentialHT = retailValueHT - purchaseCostHT;
+    let recommendation = 'Aucune commande nécessaire';
+    if (recommendedOrder > 0) recommendation = `Commander ${recommendedOrder} unité(s), soit ${recommendedOrder / packSize} lot(s) de ${packSize}.`;
+    else if (comfortOrder > 0) recommendation = `Stock suffisant, mais ${comfortOrder} unité(s) peuvent être ajoutées en confort.`;
+    const reason = `${product.positiveQty} vendue(s) en ${periodDays} jour(s), ${product.stock} en stock, colisage ${packSize}. ${recommendation}`;
+    return {
+      ...product, packSize, averageDaily, previousDaily, trend, targetDays, leadDays, safetyPct,
+      minimumOrder, recommendedOrder, comfortOrder, chosenOrder, stockAfter, coverageAfter,
+      purchaseCostHT, retailValueHT, retailValueTTC, marginPotentialHT, recommendation, orderReason: reason,
+      orderPriority: product.stock < 0 ? 1000 : (recommendedOrder > 0 ? 600 + Math.max(0, targetDays - product.coverageDays) : comfortOrder > 0 ? 200 : 0) + product.positiveQty
+    };
+  }).filter(p => p.supplier || p.recommendedOrder > 0 || p.comfortOrder > 0).sort((a, b) => b.orderPriority - a.orderPriority);
+  const bySupplier = groupBy(lines, x => x.supplier || 'FOURNISSEUR NON RENSEIGNÉ');
+  const suppliers = [...bySupplier].map(([supplier, rows]) => ({
+    supplier, lines: rows, products: rows.filter(r => r.recommendedOrder > 0).length,
+    units: sum(rows.map(r => r.recommendedOrder)), purchaseCostHT: sum(rows.map(r => r.recommendedOrder * r.averageCostHT)),
+    retailValueHT: sum(rows.map(r => r.recommendedOrder * r.priceHT)), retailValueTTC: sum(rows.map(r => r.recommendedOrder * r.priceTTC)),
+    marginPotentialHT: sum(rows.map(r => r.recommendedOrder * (r.priceHT - r.averageCostHT)))
+  })).sort((a, b) => b.purchaseCostHT - a.purchaseCostHT);
+  return { periodDays, targetDays, leadDays, safetyPct, lines, suppliers };
+}
+
+function dataQuality(data, productMap) {
+  const catalogueCodes = new Set(data.catalogue.map(r => r.code));
+  const clientNames = new Set(data.clients.map(r => normalizeText(r.name)));
+  const namedSales = data.sales.filter(r => normalizeText(r.customerName));
+  const issues = [
+    { key: 'negative-stock', severity: 'critical', label: 'Stocks négatifs', count: data.stock.filter(r => r.stock < 0).length, detail: 'Quantités impossibles nécessitant une vérification immédiate.' },
+    { key: 'missing-supplier', severity: 'warning', label: 'Produits sans fournisseur', count: data.stock.filter(r => !normalizeText(r.supplier)).length, detail: 'Limite les analyses fournisseurs et le réassort.' },
+    { key: 'orphan-products', severity: 'warning', label: 'Articles vendus absents du catalogue', count: new Set(data.sales.filter(r => !catalogueCodes.has(r.code)).map(r => r.code)).size, detail: 'Anciens articles conservés dans le catalogue historique.' },
+    { key: 'unmatched-clients', severity: 'warning', label: 'Lignes clients non rapprochées', count: namedSales.filter(r => !clientNames.has(normalizeText(r.customerName))).length, detail: 'Noms différents ou fiches absentes.' },
+    { key: 'anonymous-sales', severity: 'info', label: 'Lignes de ventes anonymes', count: data.sales.filter(r => !normalizeText(r.customerName)).length, detail: 'Réduit la portée des analyses de revisite.' },
+    { key: 'missing-created', severity: 'info', label: 'Produits sans date de création', count: data.catalogue.filter(r => !r.createdAt).length, detail: 'Limite l’analyse exacte des nouveautés.' },
+    { key: 'missing-expected', severity: 'info', label: 'Réceptions sans date prévisionnelle', count: data.receipts.filter(r => !r.expectedAt).length, detail: 'Le retard fournisseur contractuel ne peut pas être calculé.' },
+    { key: 'missing-age', severity: 'info', label: 'Clients sans âge', count: data.clients.filter(r => !Number.isFinite(r.age)).length, detail: 'Réduit la précision des analyses démographiques.' },
+    { key: 'missing-city', severity: 'info', label: 'Clients sans ville', count: data.clients.filter(r => !normalizeText(r.city)).length, detail: 'Réduit la précision de la zone de chalandise.' }
+  ];
+  const weighted = issues.reduce((acc, i) => acc + Math.min(i.count, 100) * (i.severity === 'critical' ? 1 : i.severity === 'warning' ? .35 : .08), 0);
+  return { score: clamp(Math.round(100 - weighted / 3), 0, 100), issues, counts: { products: productMap.size, sales: data.sales.length, clients: data.clients.length, receipts: data.receipts.length, movements: data.movements.length } };
+}
+
+function actionsEngine({ products, customers, sellers, suppliers, quality, customerFlow }) {
+  const actions = [];
+  const push = (type, priority, title, reason, impactTTC, impactHT, confidence, target) => actions.push({ id: `${type}-${actions.length}`, type, priority, title, reason, impactTTC: Math.max(0, impactTTC || 0), impactHT: Math.max(0, impactHT || 0), impact: Math.max(0, impactTTC || 0), confidence, target });
+  for (const p of products.filter(x => x.status === 'Rupture récente').sort((a, b) => b.marginHT - a.marginHT).slice(0, 8)) {
+    push('product', 'Critique', `Réapprovisionner ${p.name}`, p.statusReason, Math.max(p.revenueTTC * .35, p.recentQty * Math.max(1, p.priceTTC)), Math.max(p.marginHT * .35, p.recentQty * Math.max(1, p.unitMarginHT)), .85, p.code);
+  }
+  for (const p of products.filter(x => ['Stock immobilisé', 'Dormant'].includes(x.status) && x.stockValueHT > 20).sort((a, b) => b.stockValueHT - a.stockValueHT).slice(0, 8)) {
+    push('product', 'Haute', `Libérer le stock de ${p.name}`, p.statusReason, p.stockRetailTTC * .25, p.stockValueHT * .25, .8, p.code);
+  }
+  for (const c of customers.filter(x => ['À risque', 'Probablement perdu', 'Premier achat sans retour'].includes(x.status) && x.consent).sort((a, b) => b.lifetimeMarginHT - a.lifetimeMarginHT).slice(0, 10)) {
+    push('customer', 'Haute', `Réactiver ${c.name}`, c.riskReasons[0], c.lifetimeAverageBasketTTC * .6, c.lifetimeAverageBasketHT * .6, c.riskConfidence, c.name);
+  }
+  for (const c of customerFlow.nonReturned.slice(0, 5)) {
+    push('customer', 'Haute', `Comprendre l’absence de ${c.name}`, `Présent sur la période précédente (${c.previousRevenueTTC.toFixed(2)} € TTC) mais aucun ticket sur la période actuelle.`, c.previousRevenueTTC * .5, c.previousRevenueHT * .5, .7, c.name);
+  }
+  for (const s of suppliers.filter(x => x.orders >= 3 && x.serviceRate < .95).slice(0, 3)) {
+    push('supplier', 'Haute', `Sécuriser les commandes ${s.supplier}`, `Taux de réception ${(s.serviceRate * 100).toFixed(1)} % sur ${s.orders} commandes.`, Math.max(50, s.salesRevenueTTC * (1 - s.serviceRate) * .25), Math.max(40, s.salesMarginHT * (1 - s.serviceRate) * .25), .76, s.supplier);
+  }
+  for (const s of sellers.filter(x => x.potentialTTC > 20).sort((a, b) => b.potentialTTC - a.potentialTTC).slice(0, 3)) {
+    push('seller', 'Moyenne', `Développer les ventes complémentaires de ${s.seller}`, `Taux de paniers multi-familles ${(s.multiFamilyRate * 100).toFixed(1)} %, sous la moyenne de l’équipe.`, s.potentialTTC * .2, s.potentialTTC / 1.2 * .2, .65, s.seller);
+  }
+  const negative = quality.issues.find(i => i.key === 'negative-stock');
+  if (negative?.count) push('quality', 'Critique', `Corriger ${negative.count} stock(s) négatif(s)`, 'Une analyse fiable du réassort exige un stock physique cohérent.', 0, 0, .98, 'stock');
+  const missingSupplier = quality.issues.find(i => i.key === 'missing-supplier');
+  if (missingSupplier?.count) push('quality', 'Moyenne', `Renseigner ${missingSupplier.count} fournisseur(s) manquant(s)`, 'Cela améliorera le pilotage des achats et la mesure de dépendance fournisseur.', 0, 0, .95, 'catalogue');
+  return actions.sort((a, b) => (({ Critique: 4, Haute: 3, Moyenne: 2, Basse: 1 }[b.priority] || 0) - ({ Critique: 4, Haute: 3, Moyenne: 2, Basse: 1 }[a.priority] || 0)) || (b.impactTTC - a.impactTTC)).slice(0, 30);
+}
+
+function executiveInsights(analysis) {
+  const { kpis, comparison, products, customers, suppliers, drivers, customerFlow } = analysis;
+  const positives = [];
+  const risks = [];
+  if (comparison?.revenueDelta > .03) positives.push({ type: 'driver', target: 'revenue', text: `Le chiffre d’affaires progresse de ${(comparison.revenueDelta * 100).toFixed(1)} % : ${drivers.reasons.filter(r => r.impactTTC > 0).slice(0, 2).map(r => r.label).join(' et ') || 'la dynamique est globalement positive'}.` });
+  if (comparison?.marginDelta > .03) positives.push({ type: 'driver', target: 'margin', text: `La marge HT progresse de ${(comparison.marginDelta * 100).toFixed(1)} %.` });
+  const essentials = products.filter(p => p.status === 'Produit essentiel').length;
+  if (essentials) positives.push({ type: 'products', target: 'Produit essentiel', text: `${essentials} produit(s) sont essentiels au résultat : forte contribution, régularité et rentabilité.` });
+  if (customerFlow.newCount) positives.push({ type: 'customers', target: 'new', text: `${customerFlow.newCount} nouveaux acheteurs identifiés ont généré ${customerFlow.newRevenueTTC.toFixed(0)} € TTC.` });
+  const dormantValue = sum(products.filter(p => ['Dormant', 'Stock immobilisé'].includes(p.status)).map(p => p.stockValueHT));
+  if (dormantValue > 0) risks.push({ type: 'products', target: 'Dormant', text: `${dormantValue.toFixed(0)} € HT sont immobilisés dans des références dormantes ou sans vente récente.` });
+  const stockouts = products.filter(p => p.status === 'Rupture récente').length;
+  if (stockouts) risks.push({ type: 'products', target: 'Rupture récente', text: `${stockouts} référence(s) vendue(s) récemment sont en rupture. Cliquez pour voir lesquelles et préparer les commandes.` });
+  const atRisk = customers.filter(c => ['À risque', 'Probablement perdu', 'Premier achat sans retour'].includes(c.status)).length;
+  if (atRisk) risks.push({ type: 'customers', target: 'risk', text: `${atRisk} client(s) présentent un risque explicable de non-retour. Chaque fiche indique le retard, le changement de panier et le changement de consommation.` });
+  if (customerFlow.nonReturnedCount) risks.push({ type: 'customers', target: 'non-returned', text: `${customerFlow.nonReturnedCount} client(s) présents sur la période précédente ne sont pas revenus, représentant ${customerFlow.nonReturnedRevenueTTC.toFixed(0)} € TTC antérieurs.` });
+  const weakSuppliers = suppliers.filter(s => s.orders >= 3 && s.serviceRate < .95).length;
+  if (weakSuppliers) risks.push({ type: 'suppliers', target: 'weak', text: `${weakSuppliers} fournisseur(s) ont un taux de réception inférieur à 95 %.` });
+  if (!positives.length) positives.push({ type: 'driver', target: 'margin', text: `La période génère ${kpis.marginHT.toFixed(0)} € de marge HT observée.` });
+  if (!risks.length) risks.push({ type: 'actions', target: '', text: 'Aucun risque majeur ne domine la période, mais les alertes détaillées restent disponibles.' });
+  return { positives: positives.slice(0, 4), risks: risks.slice(0, 6) };
+}
+
+export function buildAnalysis(data, filters = {}, settings = {}) {
+  const productMap = buildProductMap(data);
+  const salesExtent = dateExtent(data.sales);
+  const start = filters.start ? new Date(`${filters.start}T00:00:00`) : salesExtent.min;
+  const end = filters.end ? new Date(`${filters.end}T23:59:59`) : salesExtent.max;
+  const referenceDate = end || new Date();
+  const selectedSales = data.sales.filter(r => inPeriod(r.date, start, end));
+  const selectedReceipts = data.receipts.filter(r => inPeriod(r.validatedAt || r.createdAt, start, end));
+  const selectedMovements = data.movements.filter(r => inPeriod(r.date, start, end));
+  const kpis = kpisFromLines(selectedSales, productMap);
+  const prev = previousPeriod(start, end);
+  const previousLines = prev ? data.sales.filter(r => inPeriod(r.date, prev.start, prev.end)) : [];
+  const previousKpis = kpisFromLines(previousLines, productMap);
+  const comparison = prev ? {
+    revenueDelta: safeDiv(kpis.revenueTTC - previousKpis.revenueTTC, Math.abs(previousKpis.revenueTTC)),
+    revenueHTDelta: safeDiv(kpis.revenueHT - previousKpis.revenueHT, Math.abs(previousKpis.revenueHT)),
+    marginDelta: safeDiv(kpis.marginHT - previousKpis.marginHT, Math.abs(previousKpis.marginHT)),
+    ticketDelta: safeDiv(kpis.tickets - previousKpis.tickets, previousKpis.tickets),
+    basketDelta: safeDiv(kpis.averageBasketTTC - previousKpis.averageBasketTTC, Math.abs(previousKpis.averageBasketTTC)),
+    previous: previousKpis, period: prev
+  } : null;
+  const products = productStats(data, selectedSales, previousLines, productMap, referenceDate, start || referenceDate, settings);
+  const selectedTickets = kpis.ticketsList;
+  const previousTickets = previousKpis.ticketsList;
+  const customers = customerStats(data, selectedTickets, productMap, referenceDate, start, end);
+  const customerFlow = customerFlows(data, productMap, start, end, prev, customers);
+  const sellers = sellerStats(selectedTickets, previousTickets);
+  const baskets = basketAnalysis(selectedTickets, productMap);
+  const suppliers = supplierStats(data, selectedReceipts, selectedSales, productMap);
+  const quality = dataQuality(data, productMap);
+  const demographicsStats = demographics(data, customers, selectedTickets);
+  const drivers = revenueDrivers(selectedSales, previousLines, productMap, kpis, previousKpis, customerFlow);
+  const periodDays = start && end ? daysBetween(start, end) + 1 : 0;
+  const reorder = reorderAnalysis(products, settings, periodDays);
+  const stockMarketHT = sum(data.valuation.map(r => r.marketValueHT));
+  const stockMarketTTC = sum(data.valuation.map(r => r.marketValueTTC));
+  const stockPurchaseHT = sum(data.stock.map(r => r.stockValue));
+  const analysis = {
+    meta: { start, end, referenceDate, salesExtent, selectedLines: selectedSales.length, periodDays, previousStart: prev?.start || null, previousEnd: prev?.end || null },
+    kpis, comparison, previousKpis, daily: dailySeries(selectedSales, productMap),
+    departments: categoryStats(selectedSales, productMap, 'department'), families: categoryStats(selectedSales, productMap, 'family'),
+    products, customers, customerFlow, demographics: demographicsStats, drivers, baskets,
+    revisit: revisitAnalysis(data, productMap, salesExtent.max || referenceDate), cohorts: cohortAnalysis(data, productMap, salesExtent.max || referenceDate),
+    sellers, suppliers, reorder, movements: movementStats(selectedMovements), quality,
+    stockSummary: {
+      units: sum(data.stock.map(r => r.stock)), purchaseValueHT: stockPurchaseHT, value: stockPurchaseHT,
+      marketValueHT: stockMarketHT, marketValueTTC: stockMarketTTC, potentialMarginHT: stockMarketHT - stockPurchaseHT,
+      positive: data.stock.filter(r => r.stock > 0).length, zero: data.stock.filter(r => r.stock === 0).length, negative: data.stock.filter(r => r.stock < 0).length,
+      dormantValueHT: sum(products.filter(p => ['Dormant', 'Stock immobilisé'].includes(p.status)).map(p => p.stockValueHT)),
+      dormantValue: sum(products.filter(p => ['Dormant', 'Stock immobilisé'].includes(p.status)).map(p => p.stockValueHT)),
+      stockoutCount: products.filter(p => p.status === 'Rupture récente').length
+    }
+  };
+  analysis.actions = actionsEngine(analysis);
+  analysis.insights = executiveInsights(analysis);
+  return analysis;
+}
+
+export function answerQuestion(question, analysis) {
+  const q = normalizeText(question);
+  const top = (rows, field, n = 8) => [...rows].sort((a, b) => b[field] - a[field]).slice(0, n);
+  if (/POURQUOI.*(CA|CHIFFRE)|CHIFFRE.*(MONTE|BAISSE)|CA.*(MONTE|BAISSE)/.test(q)) {
+    return {
+      title: `Pourquoi le chiffre ${analysis.drivers.changeTTC >= 0 ? 'monte' : 'baisse'}`,
+      text: `Écart de ${analysis.drivers.changeTTC.toFixed(2)} € TTC (${analysis.drivers.changeHT.toFixed(2)} € HT). Effet nombre de tickets : ${analysis.drivers.ticketEffectTTC.toFixed(2)} € TTC. Effet panier moyen : ${analysis.drivers.basketEffectTTC.toFixed(2)} € TTC. Principaux contributeurs : ${analysis.drivers.reasons.slice(0, 3).map(r => r.label).join(', ')}.`
+    };
+  }
+  if (/MARGE.*(PRODUIT|REFERENCE)|PRODUIT.*MARGE/.test(q)) return { title: 'Produits générant le plus de marge HT', rows: top(analysis.products, 'marginHT').map(p => ({ label: p.name, value: p.marginHT, detail: `${p.positiveQty} unité(s) · ${p.status}` })), unit: 'currency' };
+  if (/DORM|IMMOBIL|NE TOURNE|STOCK MORT/.test(q)) return { title: 'Stock immobilisé prioritaire', rows: top(analysis.products.filter(p => ['Dormant', 'Stock immobilisé'].includes(p.status)), 'stockValueHT').map(p => ({ label: p.name, value: p.stockValueHT, detail: `${p.daysSinceSale ?? '∞'} jours sans vente · stock ${p.stock}` })), unit: 'currency' };
+  if (/RUPTURE|REASSORT|COMMANDER|COMMANDE/.test(q)) return { title: 'Commandes recommandées', rows: analysis.reorder.lines.filter(p => p.recommendedOrder > 0).slice(0, 12).map(p => ({ label: p.name, value: p.recommendedOrder, detail: `${p.positiveQty} vendues · stock ${p.stock} · lot ${p.packSize}` })), unit: 'number' };
+  if (/CLIENT.*(RISQUE|PERD|REVEN)|REVISITE|NON REVENUS/.test(q)) return { title: 'Clients à comprendre ou réactiver', rows: top(analysis.customers.filter(c => ['À risque', 'Probablement perdu', 'En retard', 'Premier achat sans retour'].includes(c.status)), 'riskScore').map(c => ({ label: c.name, value: c.riskProbability, detail: `${c.status} · ${c.riskReasons[0]}` })), unit: 'percent' };
+  if (/AGE|VILLE|DEMOGR/.test(q)) return { title: 'Profil démographique', text: `Âge moyen ${analysis.demographics.averageAge.toFixed(1)} ans, âge médian ${analysis.demographics.medianAge.toFixed(0)} ans. Les principales villes actives sont ${analysis.demographics.cities.slice(0, 5).map(c => `${c.city} (${c.activeCustomers})`).join(', ')}.` };
+  if (/VENDEUR|EQUIPE/.test(q)) return { title: 'Performance vendeurs', rows: top(analysis.sellers, 'marginHT').map(s => ({ label: s.seller, value: s.marginHT, detail: `${s.tickets} tickets · panier ${s.averageBasketTTC.toFixed(2)} € TTC / ${s.averageBasketHT.toFixed(2)} € HT` })), unit: 'currency' };
+  if (/FOURNISSEUR|RECEPTION|LIVRAISON/.test(q)) return { title: 'Fiabilité fournisseurs', rows: [...analysis.suppliers].sort((a, b) => a.serviceRate - b.serviceRate).slice(0, 8).map(s => ({ label: s.supplier, value: s.serviceRate, detail: `${s.orders} commande(s) · ${s.partial} partielle(s)` })), unit: 'percent' };
+  if (/PANIER|ACHETE.*ENSEMBLE|COMPLEMENT/.test(q)) return { title: 'Lecture des paniers', text: `Le panier moyen est de ${analysis.kpis.averageBasketTTC.toFixed(2)} € TTC (${analysis.kpis.averageBasketHT.toFixed(2)} € HT), avec ${analysis.kpis.itemsPerTicket.toFixed(1)} article(s) par ticket. Consultez l’onglet Paniers pour les associations détaillées.` };
+  return { title: 'Synthèse ANALYSIS', text: `${analysis.insights.positives[0]?.text || ''} ${analysis.insights.risks[0]?.text || ''} L’action prioritaire est : ${analysis.actions[0]?.title || 'contrôler les alertes de données'}.` };
+}
